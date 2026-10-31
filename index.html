@@ -1,0 +1,404 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ระบบส่งงาน — นักเรียน</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Prompt:wght@500;600&family=Sarabun:wght@400;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="auth-view" class="auth-wrap" hidden>
+  <div class="auth-card card">
+    <div class="auth-logo">🎒</div>
+    <h1>ระบบส่งงาน</h1>
+    <p class="muted">สำหรับนักเรียน</p>
+    <div class="seg">
+      <button data-mode="login" class="active">เข้าสู่ระบบ</button>
+      <button data-mode="register">ลงทะเบียนใหม่</button>
+    </div>
+    <form id="login-form">
+      <label>รหัสนักเรียน<input name="sid" required autocomplete="username" inputmode="numeric"></label>
+      <label>รหัสผ่าน<input type="password" name="pw" required autocomplete="current-password"></label>
+      <button class="btn primary block">เข้าสู่ระบบ</button>
+      <p class="muted small" style="margin-top:12px">ลืมรหัสผ่าน? แจ้งคุณครูให้รีเซ็ตรหัสผ่าน</p>
+    </form>
+    <form id="reg-form" hidden>
+      <label>รหัสนักเรียน<input name="sid" required inputmode="numeric" placeholder="เช่น 12345"></label>
+      <label>ชื่อ-นามสกุล<input name="fullname" required placeholder="เช่น ด.ช.สมชาย ใจดี"></label>
+      <div id="reg-room"></div>
+      <label>เลขที่<input type="number" name="number" min="1" max="99" required></label>
+      <label>ตั้งรหัสผ่าน (อย่างน้อย 4 ตัว)<input type="password" name="pw" required minlength="4" autocomplete="new-password"></label>
+      <label>ยืนยันรหัสผ่าน<input type="password" name="pw2" required autocomplete="new-password"></label>
+      <button class="btn primary block">ลงทะเบียน</button>
+    </form>
+    <a href="admin.html" class="small-link">สำหรับคุณครู →</a>
+  </div>
+</div>
+
+<div id="app" hidden>
+  <header class="topbar">
+    <div class="brand">🎒 ระบบส่งงาน</div>
+    <div class="row">
+      <span class="who" id="who"></span>
+      <button class="btn sm" id="btn-refresh" aria-label="รีเฟรช">⟳</button>
+      <button class="btn sm" id="btn-logout">ออก</button>
+    </div>
+  </header>
+  <nav class="tabs" id="tabs">
+    <button data-tab="box">📥 กล่องงาน</button>
+    <button data-tab="enroll">📝 ลงทะเบียนรายวิชา</button>
+    <button data-tab="report">📊 รายงานการส่งงาน</button>
+  </nav>
+  <main id="main" class="container"></main>
+</div>
+
+<div id="loading" class="loading"><div class="spinner"></div>กำลังโหลด...</div>
+
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="common.js"></script>
+<script>
+const main = $('#main');
+const ID_RE = /^[A-Za-z0-9_-]{1,30}$/;
+const MAX_FILES = 4;
+let me = null, subjects = [], assignments = [], mySubs = {};
+const ui = { tab: 'box', filter: 'todo' };
+
+const pwHash = (sid, pw) => sha256(`${sid}:${pw}`);
+const subjectById = id => subjects.find(s => s.id === id);
+const myIds = () => (me.subjects || []).filter(id => subjectById(id));
+const myAssignments = () => assignments.filter(a => myIds().includes(a.subjectId));
+const canSubmit = a => Date.now() <= a.dueAt || a.allowLate !== false;
+const round2 = n => Math.round(n * 100) / 100;
+
+// ---------- Login / Register ----------
+$$('.seg button').forEach(b => b.onclick = () => {
+  $$('.seg button').forEach(x => x.classList.toggle('active', x === b));
+  $('#login-form').hidden = b.dataset.mode !== 'login';
+  $('#reg-form').hidden = b.dataset.mode !== 'register';
+});
+
+async function boot() {
+  $('#reg-room').innerHTML = classroomFields();
+  const sid = store.get('studentId'), hash = store.get('studentHash');
+  if (sid && hash) {
+    try {
+      const d = await db.collection('students').doc(sid).get();
+      if (d.exists && d.data().passwordHash === hash) { me = { id: d.id, ...d.data() }; return enter(); }
+    } catch (e) { fail(e); }
+  }
+  setLoading(false);
+  $('#auth-view').hidden = false;
+}
+
+function signIn(student, hash) {
+  store.set('studentId', student.id);
+  store.set('studentHash', hash);
+  me = student;
+  $('#auth-view').hidden = true;
+  enter();
+}
+function logout() {
+  store.del('studentId');
+  store.del('studentHash');
+  location.reload();
+}
+
+$('#login-form').onsubmit = async e => {
+  e.preventDefault();
+  const el = e.target.elements, sid = el.sid.value.trim();
+  if (!ID_RE.test(sid)) return toast('รหัสนักเรียนไม่ถูกต้อง', 'err');
+  setLoading(true);
+  try {
+    const d = await db.collection('students').doc(sid).get();
+    const hash = pwHash(sid, el.pw.value);
+    setLoading(false);
+    if (!d.exists) return toast('ไม่พบรหัสนักเรียนนี้ กรุณาลงทะเบียนก่อน', 'err');
+    if (d.data().passwordHash !== hash) return toast('รหัสผ่านไม่ถูกต้อง', 'err');
+    signIn({ id: d.id, ...d.data() }, hash);
+  } catch (err) { setLoading(false); fail(err); }
+};
+
+$('#reg-form').onsubmit = async e => {
+  e.preventDefault();
+  const f = e.target, el = f.elements;
+  const sid = el.sid.value.trim(), name = el.fullname.value.trim();
+  if (!ID_RE.test(sid)) return toast('รหัสนักเรียนใช้ได้เฉพาะตัวเลขหรือตัวอักษรภาษาอังกฤษ', 'err');
+  if (!name) return toast('กรอกชื่อ-นามสกุล', 'err');
+  if (el.pw.value.length < 4) return toast('รหัสผ่านต้องมีอย่างน้อย 4 ตัวอักษร', 'err');
+  if (el.pw.value !== el.pw2.value) return toast('รหัสผ่านทั้งสองช่องไม่ตรงกัน', 'err');
+  setLoading(true);
+  try {
+    const ref = db.collection('students').doc(sid);
+    if ((await ref.get()).exists) { setLoading(false); return toast('รหัสนักเรียนนี้ลงทะเบียนแล้ว กรุณาเข้าสู่ระบบ', 'err'); }
+    const hash = pwHash(sid, el.pw.value);
+    const data = { studentId: sid, name, classroom: readClassroom(f), number: Number(el.number.value), passwordHash: hash, subjects: [], createdAt: Date.now() };
+    await ref.set(data);
+    toast('ลงทะเบียนสำเร็จ! เลือกรายวิชาที่เรียนได้เลย');
+    signIn({ id: sid, ...data }, hash);
+  } catch (err) { setLoading(false); fail(err); }
+};
+
+// ---------- Data ----------
+async function enter() {
+  $('#app').hidden = false;
+  await reload(true);
+}
+async function reload(first) {
+  setLoading(true);
+  try {
+    await loadData();
+    if (!me) return;
+    $('#who').textContent = `${me.name} · ${me.classroom} เลขที่ ${me.number}`;
+    if (first && !myIds().length) ui.tab = 'enroll';
+    showTab(ui.tab);
+  } catch (e) { fail(e); }
+  finally { setLoading(false); }
+}
+async function loadData() {
+  const [s, a, subs, meDoc] = await Promise.all([
+    db.collection('subjects').get(),
+    db.collection('assignments').get(),
+    getSubs('studentId', me.id),
+    db.collection('students').doc(me.id).get()
+  ]);
+  if (!meDoc.exists || meDoc.data().passwordHash !== store.get('studentHash')) {
+    me = null;
+    toast('กรุณาเข้าสู่ระบบใหม่', 'err');
+    return setTimeout(logout, 1200);
+  }
+  me = { id: meDoc.id, ...meDoc.data() };
+  subjects = docsOf(s).sort((x, y) => String(x.code).localeCompare(String(y.code), 'th', { numeric: true }));
+  assignments = docsOf(a).sort((x, y) => x.dueAt - y.dueAt);
+  mySubs = Object.fromEntries(subs.map(x => [x.assignmentId, x]));
+}
+
+// ---------- Tabs ----------
+const renderers = { box: renderBox, enroll: renderEnroll, report: renderReport };
+function showTab(tab) {
+  ui.tab = tab;
+  $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  renderers[tab]();
+}
+$('#tabs').onclick = e => { const b = e.target.closest('button[data-tab]'); if (b) showTab(b.dataset.tab); };
+$('#btn-refresh').onclick = () => reload();
+$('#btn-logout').onclick = logout;
+setInterval(() => { if (me && ui.tab === 'box' && !$('.modal-backdrop')) renderBox(); }, 60000);
+
+// ---------- กล่องงาน ----------
+function renderBox() {
+  if (!myIds().length) {
+    main.innerHTML = `<section class="card">${emptyState('ยังไม่ได้ลงทะเบียนรายวิชา', `<button class="btn primary" data-goto="enroll">📝 ไปลงทะเบียนรายวิชา</button>`)}</section>`;
+  } else {
+    const items = myAssignments().map(a => ({ a, sub: mySubs[a.id], st: submissionStatus(a, mySubs[a.id]) }));
+    const isTodo = x => x.st.key === 'pending' || x.st.key === 'missing';
+    const groups = {
+      todo: items.filter(isTodo),
+      done: items.filter(x => !isTodo(x)).sort((p, q) => q.a.dueAt - p.a.dueAt),
+      all: items
+    };
+    const list = groups[ui.filter];
+    const soon = groups.todo.filter(x => x.st.key === 'pending' && x.a.dueAt - Date.now() < 86400000).length;
+    main.innerHTML = `
+      <div class="stats">
+        <div class="stat"><b>${items.length}</b><span>งานทั้งหมด</span></div>
+        <div class="stat ok"><b>${groups.done.length}</b><span>ส่งแล้ว</span></div>
+        <div class="stat danger"><b>${groups.todo.length}</b><span>ยังไม่ส่ง</span></div>
+        <div class="stat warn"><b>${soon}</b><span>ครบกำหนดภายใน 24 ชม.</span></div>
+      </div>
+      <div class="chips">
+        <button class="chip${ui.filter === 'todo' ? ' active' : ''}" data-filter="todo">ยังไม่ส่ง (${groups.todo.length})</button>
+        <button class="chip${ui.filter === 'done' ? ' active' : ''}" data-filter="done">ส่งแล้ว (${groups.done.length})</button>
+        <button class="chip${ui.filter === 'all' ? ' active' : ''}" data-filter="all">ทั้งหมด (${items.length})</button>
+      </div>
+      ${list.length ? `<div class="tasks">${list.map(taskCard).join('')}</div>`
+        : `<section class="card">${emptyState(ui.filter === 'todo' ? '🎉 ส่งงานครบแล้ว ไม่มีงานค้าง' : 'ยังไม่มีงานในหมวดนี้')}</section>`}`;
+  }
+  main.onclick = e => {
+    const t = e.target.closest('[data-filter],[data-submit],[data-view],[data-goto]');
+    if (!t) return;
+    if (t.dataset.filter) { ui.filter = t.dataset.filter; renderBox(); }
+    else if (t.dataset.goto) showTab(t.dataset.goto);
+    else {
+      const a = assignments.find(x => x.id === (t.dataset.submit || t.dataset.view));
+      openSubmit(a, !!t.dataset.view);
+    }
+  };
+}
+
+function taskCard({ a, sub, st }) {
+  const s = subjectById(a.subjectId), tl = timeLeft(a.dueAt);
+  const sent = !!(sub && sub.submittedAt), graded = !!(sub && sub.score != null);
+  let btn;
+  if (graded) btn = `<button class="btn sm" data-view="${a.id}">ดูรายละเอียด</button>`;
+  else if (!canSubmit(a)) btn = sent ? `<button class="btn sm" data-view="${a.id}">ดูงานที่ส่ง</button>` : '<button class="btn sm" disabled>ปิดรับงานแล้ว</button>';
+  else if (sent) btn = `<button class="btn sm" data-submit="${a.id}">✏️ แก้ไข/ส่งใหม่</button>`;
+  else btn = `<button class="btn sm primary" data-submit="${a.id}">📤 ส่งงาน</button>`;
+  return `<article class="task ${st.key}">
+    <div class="task-top"><span class="subj">${esc(s.code)} ${esc(s.name)}</span>${statusBadge(st)}</div>
+    <h3>${esc(a.title)}</h3>
+    ${a.description ? `<p class="desc clamp">${esc(a.description)}</p>` : ''}
+    <div class="task-meta">
+      <span>📅 ${fmtDate(a.dueAt)}</span>
+      ${!sent && !graded ? `<span class="badge lv-${tl.level}">${tl.text}</span>` : ''}
+      <span>เต็ม ${a.maxScore}</span>
+    </div>
+    ${sent ? `<div class="small muted">ส่งเมื่อ ${fmtDate(sub.submittedAt)}</div>` : ''}
+    ${graded ? `<div class="score-line">ได้คะแนน <b>${sub.score}</b> / ${a.maxScore}</div>` : sent ? '<div class="small muted">⏳ รอครูตรวจ</div>' : ''}
+    ${sub && sub.feedback ? `<div class="feedback">💬 ${esc(sub.feedback)}</div>` : ''}
+    <div class="task-actions">${btn}</div>
+  </article>`;
+}
+
+function openSubmit(a, readOnly) {
+  const sub = mySubs[a.id], s = subjectById(a.subjectId);
+  const late = Date.now() > a.dueAt;
+  const m = openModal(a.title, `
+    <p class="muted small">${esc(s.code)} ${esc(s.name)} · กำหนดส่ง ${fmtDate(a.dueAt)} · คะแนนเต็ม ${a.maxScore}</p>
+    ${a.description ? `<div class="note">${esc(a.description)}</div>` : ''}
+    ${sub && sub.score != null ? `<p class="score-line">ได้คะแนน <b>${sub.score}</b> / ${a.maxScore}</p>` : ''}
+    ${sub && sub.feedback ? `<div class="feedback">💬 ${esc(sub.feedback)}</div>` : ''}
+    ${sub && sub.submittedAt ? `<h4>งานที่ส่งไว้ ${statusBadge(submissionStatus(a, sub))}</h4>${workHtml(sub)}` : ''}
+    ${readOnly ? '<div class="row"><button class="btn ghost" data-close>ปิด</button></div>' : `
+    <form id="sm">
+      <label>ลิงก์งาน (Google Drive, Canva, YouTube ฯลฯ)<input name="link" inputmode="url" placeholder="https://..." value="${esc(sub ? sub.link || '' : '')}"></label>
+      <label>ข้อความถึงครู<textarea name="note" rows="3" placeholder="พิมพ์คำตอบหรือข้อความถึงครู">${esc(sub ? sub.note || '' : '')}</textarea></label>
+      <label>แนบรูปภาพงาน (สูงสุด ${MAX_FILES} รูป)${sub && sub.fileCount ? ' — ถ้าเลือกรูปใหม่จะแทนที่รูปเดิม' : ''}<input type="file" name="files" accept="image/*" multiple></label>
+      <div class="preview" id="sm-preview"></div>
+      ${late ? '<p class="warn-text">⚠️ เลยกำหนดส่งแล้ว งานนี้จะถูกบันทึกว่า "ส่งช้า"</p>' : ''}
+      <div class="row"><button class="btn primary">📤 ยืนยันส่งงาน</button><button type="button" class="btn ghost" data-close>ยกเลิก</button></div>
+    </form>`}`);
+  if (sub && sub.fileCount) loadFiles(sub.id, $('.files', m));
+  const f = $('#sm', m);
+  if (!f) return;
+  const fileInput = f.elements.files;
+  fileInput.onchange = () => {
+    const pv = $('#sm-preview', m);
+    pv.innerHTML = '';
+    if (fileInput.files.length > MAX_FILES) toast(`แนบได้สูงสุด ${MAX_FILES} รูป ระบบจะใช้ ${MAX_FILES} รูปแรก`, 'err');
+    [...fileInput.files].slice(0, MAX_FILES).forEach(file => { const img = new Image(); img.src = URL.createObjectURL(file); pv.appendChild(img); });
+  };
+  f.onsubmit = async e => {
+    e.preventDefault();
+    const link = f.elements.link.value.trim(), note = f.elements.note.value.trim();
+    const files = [...fileInput.files].slice(0, MAX_FILES);
+    if (!link && !note && !files.length && !(sub && sub.fileCount)) return toast('กรุณาใส่ลิงก์ แนบรูป หรือพิมพ์ข้อความอย่างน้อย 1 อย่าง', 'err');
+    if (!canSubmit(a)) return toast('งานนี้ปิดรับแล้ว', 'err');
+    const btn = $('button.primary', f);
+    btn.disabled = true;
+    btn.textContent = 'กำลังส่ง...';
+    try {
+      const subId = `${a.id}_${me.id}`, now = Date.now();
+      const images = [];
+      for (const file of files) images.push(await compressImage(file));
+      const batch = db.batch();
+      if (files.length) {
+        const old = await db.collection('submissionFiles').where('submissionId', '==', subId).get();
+        old.docs.forEach(d => batch.delete(d.ref));
+        images.forEach((dataUrl, i) => batch.set(db.collection('submissionFiles').doc(), {
+          submissionId: subId, assignmentId: a.id, subjectId: a.subjectId, studentId: me.id, order: i, name: files[i].name, dataUrl
+        }));
+      }
+      batch.set(db.collection('submissions').doc(subId), {
+        assignmentId: a.id, subjectId: a.subjectId, studentId: me.id, studentName: me.name,
+        link, note, fileCount: files.length ? images.length : (sub ? sub.fileCount || 0 : 0),
+        submittedAt: now, late: now > a.dueAt
+      }, { merge: true });
+      await batch.commit();
+      closeModal();
+      toast(now > a.dueAt ? 'ส่งงานแล้ว (ส่งช้า)' : 'ส่งงานเรียบร้อยแล้ว ✓');
+      await reload();
+    } catch (err) {
+      fail(err);
+      btn.disabled = false;
+      btn.textContent = '📤 ยืนยันส่งงาน';
+    }
+  };
+}
+
+// ---------- ลงทะเบียนรายวิชา ----------
+function renderEnroll() {
+  const ids = me.subjects || [];
+  main.innerHTML = `<section class="card">
+    <h2>ลงทะเบียนรายวิชา</h2>
+    <p class="muted">เลือกรายวิชาที่เรียนกับคุณครู เมื่อลงทะเบียนแล้วจะเห็นกล่องงานของวิชานั้นในแท็บ "กล่องงาน"</p>
+    ${subjects.length ? `<div class="tasks">${subjects.map(s => {
+      const on = ids.includes(s.id), n = assignments.filter(a => a.subjectId === s.id).length;
+      const btn = on ? `<button class="btn sm danger-ghost" data-unenroll="${s.id}">ยกเลิกการลงทะเบียน</button>`
+        : s.open === false ? '<button class="btn sm" disabled>ปิดรับลงทะเบียน</button>'
+        : `<button class="btn sm primary" data-enroll="${s.id}">+ ลงทะเบียนวิชานี้</button>`;
+      return `<article class="task ${on ? 'done' : ''}">
+        <div class="task-top"><span class="subj">${esc(s.code)}</span>${on ? '<span class="badge ok">✓ ลงทะเบียนแล้ว</span>' : ''}</div>
+        <h3>${esc(s.name)}</h3>
+        ${s.description ? `<p class="desc">${esc(s.description)}</p>` : ''}
+        <div class="task-meta"><span>📥 ${n} งาน</span></div>
+        <div class="task-actions">${btn}</div>
+      </article>`;
+    }).join('')}</div>` : emptyState('คุณครูยังไม่ได้เพิ่มรายวิชา')}
+  </section>`;
+  main.onclick = async e => {
+    const b = e.target.closest('[data-enroll],[data-unenroll]');
+    if (!b) return;
+    const id = b.dataset.enroll || b.dataset.unenroll, s = subjectById(id), add = !!b.dataset.enroll;
+    if (!add && !confirm(`ยกเลิกการลงทะเบียนวิชา ${s.code} ${s.name} ?\n(งานที่เคยส่งไว้จะยังอยู่ ลงทะเบียนใหม่ได้ภายหลัง)`)) return;
+    b.disabled = true;
+    try {
+      await db.collection('students').doc(me.id).update({ subjects: add ? FieldValue.arrayUnion(id) : FieldValue.arrayRemove(id) });
+      me.subjects = add ? [...ids, id] : ids.filter(x => x !== id);
+      toast(add ? `ลงทะเบียนวิชา ${s.name} แล้ว` : 'ยกเลิกการลงทะเบียนแล้ว');
+      renderEnroll();
+    } catch (err) { fail(err); b.disabled = false; }
+  };
+}
+
+// ---------- รายงานการส่งงาน ----------
+function renderReport() {
+  main.onclick = null;
+  const mine = myIds().map(subjectById);
+  if (!mine.length) {
+    main.innerHTML = `<section class="card">${emptyState('ยังไม่ได้ลงทะเบียนรายวิชา', `<button class="btn primary" onclick="showTab('enroll')">📝 ไปลงทะเบียนรายวิชา</button>`)}</section>`;
+    return;
+  }
+  const all = myAssignments().map(a => submissionStatus(a, mySubs[a.id]).key);
+  const n = k => all.filter(x => x === k).length;
+  main.innerHTML = `
+    <div class="stats">
+      <div class="stat"><b>${all.length}</b><span>งานทั้งหมด</span></div>
+      <div class="stat ok"><b>${n('done')}</b><span>ส่งตรงเวลา</span></div>
+      <div class="stat warn"><b>${n('late')}</b><span>ส่งช้า</span></div>
+      <div class="stat danger"><b>${n('missing')}</b><span>ค้างส่ง</span></div>
+      <div class="stat"><b>${n('pending')}</b><span>ยังไม่ถึงกำหนด</span></div>
+    </div>
+    ${mine.map(s => {
+      const list = assignments.filter(a => a.subjectId === s.id);
+      let got = 0, full = 0;
+      const rows = list.map((a, i) => {
+        const sub = mySubs[a.id], st = submissionStatus(a, sub);
+        full += Number(a.maxScore) || 0;
+        if (sub && sub.score != null) got += Number(sub.score);
+        const scoreCell = sub && sub.score != null ? `<b>${sub.score}</b> / ${a.maxScore}`
+          : sub && sub.submittedAt ? '<span class="muted">รอตรวจ</span>' : `<span class="muted">- / ${a.maxScore}</span>`;
+        return `<tr>
+          <td class="num">${i + 1}</td>
+          <td>${esc(a.title)}${sub && sub.feedback ? `<div class="small muted">💬 ${esc(sub.feedback)}</div>` : ''}</td>
+          <td class="small nowrap">${fmtDate(a.dueAt)}</td>
+          <td>${statusBadge(st)}${sub && sub.submittedAt ? `<div class="small muted nowrap">${fmtDate(sub.submittedAt)}</div>` : ''}</td>
+          <td class="num nowrap">${scoreCell}</td>
+        </tr>`;
+      }).join('');
+      return `<section class="card">
+        <div class="card-head"><h2>${esc(s.code)} ${esc(s.name)}</h2><span class="badge ok">คะแนนรวม ${round2(got)} / ${round2(full)}</span></div>
+        ${list.length ? `<div class="table-wrap"><table>
+          <thead><tr><th class="num">#</th><th>งาน</th><th>กำหนดส่ง</th><th>สถานะ</th><th class="num">คะแนน</th></tr></thead>
+          <tbody>${rows}</tbody></table></div>` : emptyState('ยังไม่มีงานในวิชานี้')}
+      </section>`;
+    }).join('')}`;
+}
+
+boot();
+</script>
+</body>
+</html>
