@@ -151,7 +151,7 @@ function gradebookModel(book, assignmentList, roster, subs) {
     });
     r.total = round2(total);
     r.pct = fullTotal ? round2(total / fullTotal * 100) : 0;
-    r.grade = thaiGrade(r.pct);
+    r.grade = thaiGrade(r.total);
   });
   return { cols, rows, fullTotal };
 }
