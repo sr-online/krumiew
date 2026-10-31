@@ -113,6 +113,84 @@ function submissionStatus(a, sub) {
 }
 function statusBadge(st) { return `<span class="badge st-${st.key}">${st.text}</span>`; }
 
+const round2 = n => Math.round(n * 100) / 100;
+const newId = p => p + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+// ===== Gradebook (ตารางคะแนนรวม) =====
+// book = gradebooks/{subjectId}: { columns:[{id,title,type,max}], extraRows:[{id,name,classroom,number}],
+//   cells:{[rowKey]:{[colId]:value}}, includeAssignments, showGrade, showAll }
+const GRADE_STEPS = [[80, '4'], [75, '3.5'], [70, '3'], [65, '2.5'], [60, '2'], [55, '1.5'], [50, '1'], [0, '0']];
+const thaiGrade = pct => GRADE_STEPS.find(([min]) => pct >= min)[1];
+
+function gradebookModel(book, assignmentList, roster, subs) {
+  book = book || {};
+  const cells = book.cells || {};
+  const subMap = new Map(subs.map(s => [`${s.assignmentId}_${s.studentId}`, s]));
+  const cols = [];
+  if (book.includeAssignments !== false) assignmentList.forEach(a => cols.push({ key: 'a:' + a.id, aid: a.id, title: a.title, max: Number(a.maxScore) || 0, kind: 'assign', type: 'number', counted: true }));
+  (book.columns || []).forEach(c => cols.push({ key: c.id, id: c.id, title: c.title, max: Number(c.max) || 0, kind: 'custom', type: c.type || 'number', counted: (c.type || 'number') === 'number' }));
+  const fullTotal = round2(cols.filter(c => c.counted).reduce((n, c) => n + c.max, 0));
+  const rows = [
+    ...roster.map(st => ({ key: st.id, id: st.id, studentId: st.id, name: st.name, classroom: st.classroom, number: st.number, custom: false })),
+    ...(book.extraRows || []).map(r => ({ key: r.id, id: r.id, name: r.name || '', classroom: r.classroom || '', number: r.number || '', custom: true }))
+  ].sort((a, b) => (!a.classroom - !b.classroom) || studentCompare(a, b));
+  rows.forEach(r => {
+    r.values = {};
+    let total = 0;
+    cols.forEach(c => {
+      let v;
+      if (c.kind === 'assign') {
+        const s = r.studentId && subMap.get(`${c.aid}_${r.studentId}`);
+        v = s && s.score != null ? s.score : '';
+      } else {
+        const x = (cells[r.key] || {})[c.id];
+        v = x == null ? '' : x;
+      }
+      r.values[c.key] = v;
+      if (c.counted && v !== '' && !isNaN(Number(v))) total += Number(v);
+    });
+    r.total = round2(total);
+    r.pct = fullTotal ? round2(total / fullTotal * 100) : 0;
+    r.grade = thaiGrade(r.pct);
+  });
+  return { cols, rows, fullTotal };
+}
+
+function gradebookTable(model, { editable = false, highlight = '', showGrade = true } = {}) {
+  const { cols, rows, fullTotal } = model;
+  const span = cols.length + 4 + (showGrade ? 1 : 0);
+  const head = `<tr><th class="num sticky-1">เลขที่</th><th class="sticky-2">ชื่อ-นามสกุล</th>${cols.map(c => {
+    const label = `${esc(c.title)}<div class="muted small">${c.counted ? 'เต็ม ' + c.max : 'ข้อความ'}${c.kind === 'assign' ? ' · งาน' : ''}</div>`;
+    return `<th class="a-col ${c.kind}">${editable && c.kind === 'custom' ? `<button class="col-btn" data-editcol="${c.id}" title="แก้ไข/ย้าย/ลบคอลัมน์">${label}</button>` : label}</th>`;
+  }).join('')}<th class="num">รวม<div class="muted small">เต็ม ${fullTotal}</div></th><th class="num">%</th>${showGrade ? '<th class="num">เกรด</th>' : ''}</tr>`;
+
+  let body = '', last = null;
+  rows.forEach(r => {
+    if (r.classroom !== last) {
+      last = r.classroom;
+      body += `<tr class="group"><td colspan="${span}">${r.classroom ? 'ห้อง ' + esc(r.classroom) : 'อื่น ๆ'}</td></tr>`;
+    }
+    body += `<tr data-row="${esc(r.key)}"${r.key === highlight ? ' class="me"' : ''}>
+      <td class="num sticky-1">${esc(r.number)}</td>
+      <td class="sticky-2 nowrap">${esc(r.name) || '<span class="muted">(ไม่มีชื่อ)</span>'}
+        ${editable && r.custom ? `<button class="icon-btn" data-editrow="${esc(r.key)}" title="แก้ไขแถว">✎</button>` : ''}
+        <div class="muted small">${r.studentId ? esc(r.studentId) : 'แถวที่เพิ่มเอง'}</div></td>
+      ${cols.map(c => {
+        const v = r.values[c.key];
+        if (editable && c.kind === 'custom') {
+          return `<td class="gcell"><input class="gi${c.type === 'text' ? ' text' : ''}" data-r="${esc(r.key)}" data-c="${c.key}" value="${esc(v)}" inputmode="${c.type === 'number' ? 'decimal' : 'text'}" autocomplete="off"></td>`;
+        }
+        return `<td class="${c.type === 'text' ? '' : 'num'}${c.kind === 'assign' ? ' locked' : ''}">${v === '' ? '<span class="muted">-</span>' : esc(v)}</td>`;
+      }).join('')}
+      <td class="num t-total"><b>${r.total}</b></td>
+      <td class="num t-pct">${r.pct}</td>
+      ${showGrade ? `<td class="num t-grade"><b>${r.grade}</b></td>` : ''}
+    </tr>`;
+  });
+  return `<div class="table-wrap sheet"><table class="sheet-table"><thead>${head}</thead><tbody>${body ||
+    `<tr><td colspan="${span}" class="empty">ยังไม่มีแถว</td></tr>`}</tbody></table></div>`;
+}
+
 function docsOf(snap) { return snap.docs.map(d => ({ id: d.id, ...d.data() })); }
 async function getSubs(field, value) {
   return docsOf(await db.collection('submissions').where(field, '==', value).get());

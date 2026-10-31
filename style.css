@@ -107,6 +107,30 @@ tr.dirty td { background: #fffbeb; }
 .cell-pending { color: #94a3b8; }
 .legend { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; font-size: .85rem; align-items: center; }
 
+/* Gradebook sheet (Excel-like) */
+.sheet { max-height: 72vh; overflow: auto; }
+.sheet-table { border-collapse: separate; border-spacing: 0; }
+.sheet-table th, .sheet-table td { border-bottom: 1px solid var(--line); border-right: 1px solid var(--line); background: #fff; }
+.sheet-table th { position: sticky; top: 0; z-index: 2; background: #f8fafc; }
+.sheet-table .sticky-1 { position: sticky; left: 0; z-index: 1; width: 58px; min-width: 58px; max-width: 58px; }
+.sheet-table .sticky-2 { position: sticky; left: 58px; z-index: 1; min-width: 170px; box-shadow: 2px 0 0 var(--line); }
+.sheet-table th.sticky-1, .sheet-table th.sticky-2 { z-index: 3; }
+.sheet-table tr.group td { background: var(--primary-soft); }
+.sheet-table tr.me td { background: #fef9c3; }
+.sheet-table th.custom { background: #f0fdfa; }
+.sheet-table td.locked { background: #f8fafc; color: #475569; }
+.sheet-table td.gcell { padding: 0; }
+.gi { border: 0; border-radius: 0; width: 100%; min-width: 72px; text-align: center; padding: 9px 8px; background: transparent; }
+.gi:focus { outline: 2px solid var(--primary); outline-offset: -2px; background: #f0fdfa; }
+.gi.text { text-align: left; min-width: 150px; }
+.gi.invalid { background: var(--danger-soft); color: var(--danger); }
+.col-btn { border: 0; background: none; font: inherit; font-weight: 600; cursor: pointer; color: var(--primary-d); padding: 0; width: 100%; }
+.col-btn:hover { text-decoration: underline; }
+.sticky-2 .icon-btn { font-size: .95rem; padding: 0 4px; }
+.toggles { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; margin-bottom: 12px; font-size: .92rem; }
+.toggles label { margin: 0; }
+@media (max-width: 560px) { .sheet-table .sticky-2 { min-width: 130px; } }
+
 /* Stats */
 .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 16px; }
 .stat { background: #fff; border-radius: 12px; padding: 12px 14px; box-shadow: var(--shadow); }

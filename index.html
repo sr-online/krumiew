@@ -51,6 +51,7 @@
     <button data-tab="box">📥 กล่องงาน</button>
     <button data-tab="enroll">📝 ลงทะเบียนรายวิชา</button>
     <button data-tab="report">📊 รายงานการส่งงาน</button>
+    <button data-tab="book">📋 ตารางคะแนน</button>
   </nav>
   <main id="main" class="container"></main>
 </div>
@@ -72,7 +73,7 @@ const subjectById = id => subjects.find(s => s.id === id);
 const myIds = () => (me.subjects || []).filter(id => subjectById(id));
 const myAssignments = () => assignments.filter(a => myIds().includes(a.subjectId));
 const canSubmit = a => Date.now() <= a.dueAt || a.allowLate !== false;
-const round2 = n => Math.round(n * 100) / 100;
+let bookSeq = 0;
 
 // ---------- Login / Register ----------
 $$('.seg button').forEach(b => b.onclick = () => {
@@ -177,7 +178,7 @@ async function loadData() {
 }
 
 // ---------- Tabs ----------
-const renderers = { box: renderBox, enroll: renderEnroll, report: renderReport };
+const renderers = { box: renderBox, enroll: renderEnroll, report: renderReport, book: renderBook };
 function showTab(tab) {
   ui.tab = tab;
   $$('#tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
@@ -396,6 +397,50 @@ function renderReport() {
           <tbody>${rows}</tbody></table></div>` : emptyState('ยังไม่มีงานในวิชานี้')}
       </section>`;
     }).join('')}`;
+}
+
+// ---------- ตารางคะแนน (ดูได้อย่างเดียว) ----------
+async function renderBook() {
+  main.onclick = null;
+  const ids = myIds();
+  if (!ids.length) {
+    main.innerHTML = `<section class="card">${emptyState('ยังไม่ได้ลงทะเบียนรายวิชา', `<button class="btn primary" onclick="showTab('enroll')">📝 ไปลงทะเบียนรายวิชา</button>`)}</section>`;
+    return;
+  }
+  if (!ids.includes(ui.bookSubject)) ui.bookSubject = ids[0];
+  main.innerHTML = `<section class="card">
+    <div class="card-head"><h2>📋 ตารางคะแนน</h2>
+      <select id="bk-subject" aria-label="เลือกรายวิชา">${ids.map(id => { const s = subjectById(id); return `<option value="${id}"${id === ui.bookSubject ? ' selected' : ''}>${esc(s.code)} ${esc(s.name)}</option>`; }).join('')}</select>
+    </div>
+    <div id="bk-body">${loadingHtml}</div>
+  </section>`;
+  $('#bk-subject').onchange = e => { ui.bookSubject = e.target.value; renderBook(); };
+
+  const t = ++bookSeq, sid = ui.bookSubject;
+  try {
+    const snap = await db.collection('gradebooks').doc(sid).get();
+    let book = snap.exists ? snap.data() : {}, roster, subs;
+    if (book.showAll) {
+      const [st, sb] = await Promise.all([db.collection('students').where('subjects', 'array-contains', sid).get(), getSubs('subjectId', sid)]);
+      roster = docsOf(st);
+      subs = sb;
+    } else {
+      roster = [me];
+      subs = Object.values(mySubs).filter(s => s.subjectId === sid);
+      book = { ...book, extraRows: [] };
+    }
+    if (t !== bookSeq || ui.tab !== 'book') return;
+    const model = gradebookModel(book, assignments.filter(a => a.subjectId === sid), roster, subs);
+    const mine = model.rows.find(r => r.key === me.id), showGrade = book.showGrade !== false;
+    $('#bk-body').innerHTML = !model.cols.length ? emptyState('คุณครูยังไม่ได้ลงคะแนนในวิชานี้') : `
+      ${mine ? `<div class="stats">
+        <div class="stat ok"><b>${mine.total}</b><span>คะแนนรวม (เต็ม ${model.fullTotal})</span></div>
+        <div class="stat"><b>${mine.pct}%</b><span>ร้อยละ</span></div>
+        ${showGrade ? `<div class="stat warn"><b>${mine.grade}</b><span>เกรด (โดยประมาณ)</span></div>` : ''}
+      </div>` : ''}
+      <p class="muted small">🔒 ดูได้อย่างเดียว ${book.showAll ? '· แถวสีเหลืองคือของฉัน' : ''} · หากคะแนนไม่ถูกต้องให้แจ้งคุณครู</p>
+      ${gradebookTable(model, { highlight: me.id, showGrade })}`;
+  } catch (e) { if (t === bookSeq) $('#bk-body').innerHTML = ''; fail(e); }
 }
 
 boot();

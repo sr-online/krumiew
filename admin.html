@@ -37,6 +37,7 @@
     <button data-tab="assignments">📥 กล่องรับงาน</button>
     <button data-tab="grading">✏️ ตรวจงาน/ให้คะแนน</button>
     <button data-tab="report">📊 รายงานการส่งงาน</button>
+    <button data-tab="gradebook">📋 ตารางคะแนน</button>
     <button data-tab="students">👥 นักเรียน</button>
     <button data-tab="settings">⚙️ ตั้งค่า</button>
   </nav>
@@ -60,7 +61,6 @@ const enrolledIn = sid => students.filter(s => (s.subjects || []).includes(sid))
 const assignmentsOf = sid => assignments.filter(a => a.subjectId === sid);
 const roomsOf = list => [...new Set(list.map(s => s.classroom))].sort(classroomCompare);
 const subjectLabel = s => s ? `${s.code} ${s.name}` : '(ไม่พบวิชา)';
-const round2 = n => Math.round(n * 100) / 100;
 
 function subjectOptions(selected) {
   return subjects.map(s => `<option value="${s.id}"${s.id === selected ? ' selected' : ''}>${esc(subjectLabel(s))}</option>`).join('');
@@ -127,8 +127,9 @@ async function loadAll() {
 }
 
 // ---------- Tabs ----------
-const renderers = { subjects: renderSubjects, assignments: renderAssignments, grading: renderGrading, report: renderReport, students: renderStudents, settings: renderSettings };
+const renderers = { subjects: renderSubjects, assignments: renderAssignments, grading: renderGrading, report: renderReport, gradebook: renderGradebook, students: renderStudents, settings: renderSettings };
 function showTab(tab) {
+  flushCells();
   ui.tab = tab;
   renderSeq++;
   main.onclick = null;
@@ -221,6 +222,7 @@ function renderSubjects() {
           enrolled.slice(i, i + 400).forEach(st => batch.update(db.collection('students').doc(st.id), { subjects: FieldValue.arrayRemove(s.id) }));
           await batch.commit();
         }
+        await db.collection('gradebooks').doc(s.id).delete();
         await db.collection('subjects').doc(s.id).delete();
         toast('ลบรายวิชาแล้ว');
       } catch (err) { fail(err); }
@@ -549,6 +551,267 @@ async function renderReport() {
     });
     downloadCSV(`คะแนน_${s.code}${ui.classroom ? '_' + ui.classroom.replace('/', '-') : ''}.csv`, out);
   };
+}
+
+// ---------- ตารางคะแนน (แบบ Excel) ----------
+let gb = null;          // { sid, ref, book, roster, subs, model }
+let pending = null;     // { ref, cells } รอบันทึก
+let saveTimer = null;
+
+function setSaveStatus(text) { const el = $('#gb-status'); if (el) el.textContent = text; }
+function flushCells() {
+  clearTimeout(saveTimer);
+  if (!pending) return;
+  const { ref, cells } = pending;
+  pending = null;
+  ref.set({ cells, updatedAt: Date.now() }, { merge: true })
+    .then(() => setSaveStatus('✓ บันทึกแล้ว'))
+    .catch(fail);
+}
+function queueCell(rowKey, colId, val) {
+  if (pending && pending.ref !== gb.ref) flushCells();
+  if (!pending) pending = { ref: gb.ref, cells: {} };
+  (pending.cells[rowKey] = pending.cells[rowKey] || {})[colId] = val === null ? FieldValue.delete() : val;
+  setSaveStatus('กำลังบันทึก...');
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(flushCells, 700);
+}
+function saveBook(partial) {
+  setSaveStatus('กำลังบันทึก...');
+  return gb.ref.set({ ...partial, updatedAt: Date.now() }, { merge: true })
+    .then(() => setSaveStatus('✓ บันทึกแล้ว'))
+    .catch(fail);
+}
+window.addEventListener('beforeunload', e => { if (pending) { flushCells(); e.preventDefault(); e.returnValue = ''; } });
+
+async function renderGradebook() {
+  ensureSubject();
+  if (!subjects.length) return noSubjects();
+  main.innerHTML = `<section class="card">
+    <div class="filters">
+      <label>รายวิชา<select id="gb-subject">${subjectOptions(ui.subjectId)}</select></label>
+      <label>ห้อง<select id="gb-room"><option value="">ทุกห้อง</option></select></label>
+      <div class="row">
+        <button class="btn" id="gb-addcol">+ เพิ่มคอลัมน์</button>
+        <button class="btn" id="gb-addrow">+ เพิ่มแถว</button>
+        <button class="btn primary" id="gb-export">⬇ Export Excel</button>
+      </div>
+    </div>
+    <div class="toggles">
+      <label class="check"><input type="checkbox" id="gb-inc"> รวมคะแนนจากกล่องงาน</label>
+      <label class="check"><input type="checkbox" id="gb-grade"> แสดงเกรด</label>
+      <label class="check"><input type="checkbox" id="gb-all"> ให้นักเรียนเห็นคะแนนทั้งตาราง (ปิด = เห็นเฉพาะของตัวเอง)</label>
+      <span class="muted small" id="gb-status"></span>
+    </div>
+    <div id="gb-body">${loadingHtml}</div>
+    <p class="muted small" style="margin:10px 0 0">💡 คลิกช่องเพื่อพิมพ์คะแนน ระบบบันทึกให้อัตโนมัติ · กด Enter/↓/↑ เพื่อเลื่อนแถว · คลิกหัวคอลัมน์เพื่อแก้ไข ย้าย หรือลบ ·
+      ช่องสีเทาคือคะแนนจากกล่องงาน (แก้ไขที่แท็บ "ตรวจงาน/ให้คะแนน") · เกรดคิดจากร้อยละ 80=4, 75=3.5, 70=3, 65=2.5, 60=2, 55=1.5, 50=1</p>
+  </section>`;
+  $('#gb-subject').onchange = e => { flushCells(); ui.subjectId = e.target.value; renderGradebook(); };
+
+  const t = ++renderSeq, sid = ui.subjectId, ref = db.collection('gradebooks').doc(sid);
+  let snap, subs;
+  try { [snap, subs] = await Promise.all([ref.get(), getSubs('subjectId', sid)]); } catch (e) { return fail(e); }
+  if (t !== renderSeq) return;
+  gb = { sid, ref, book: snap.exists ? snap.data() : {}, roster: enrolledIn(sid), subs };
+  const book = gb.book;
+  book.columns = book.columns || [];
+  book.extraRows = book.extraRows || [];
+  book.cells = book.cells || {};
+
+  $('#gb-inc').checked = book.includeAssignments !== false;
+  $('#gb-grade').checked = book.showGrade !== false;
+  $('#gb-all').checked = !!book.showAll;
+  $('#gb-inc').onchange = e => { book.includeAssignments = e.target.checked; saveBook({ includeAssignments: e.target.checked }); drawGradebook(); };
+  $('#gb-grade').onchange = e => { book.showGrade = e.target.checked; saveBook({ showGrade: e.target.checked }); drawGradebook(); };
+  $('#gb-all').onchange = e => { book.showAll = e.target.checked; saveBook({ showAll: e.target.checked }); };
+  $('#gb-room').onchange = e => { ui.classroom = e.target.value; drawGradebook(); };
+  $('#gb-addcol').onclick = () => openColumnModal(null);
+  $('#gb-addrow').onclick = () => openRowModal(null);
+  $('#gb-export').onclick = exportGradebook;
+
+  const body = $('#gb-body');
+  body.oninput = e => {
+    const inp = e.target.closest('input.gi');
+    if (!inp) return;
+    const col = gb.model.cols.find(c => c.key === inp.dataset.c), rk = inp.dataset.r;
+    const raw = inp.value.trim();
+    let val = raw === '' ? null : raw;
+    if (col.type === 'number' && val !== null) {
+      val = Number(raw);
+      if (isNaN(val) || val < 0 || (col.max && val > col.max)) {
+        inp.classList.add('invalid');
+        inp.title = `ใส่ตัวเลข 0–${col.max || '∞'}`;
+        return;
+      }
+    }
+    inp.classList.remove('invalid');
+    inp.title = '';
+    const row = book.cells[rk] = book.cells[rk] || {};
+    if (val === null) delete row[col.id]; else row[col.id] = val;
+    queueCell(rk, col.id, val);
+    updateRowTotals(rk);
+  };
+  body.onkeydown = e => {
+    const inp = e.target.closest('input.gi');
+    if (!inp || !['Enter', 'ArrowDown', 'ArrowUp'].includes(e.key)) return;
+    e.preventDefault();
+    const list = $$(`input.gi[data-c="${inp.dataset.c}"]`, body);
+    const next = list[list.indexOf(inp) + (e.key === 'ArrowUp' ? -1 : 1)];
+    if (next) { next.focus(); next.select(); }
+  };
+  body.onfocusin = e => { if (e.target.matches('input.gi')) e.target.select(); };
+  main.onclick = e => {
+    const c = e.target.closest('[data-editcol]'), r = e.target.closest('[data-editrow]');
+    if (c) openColumnModal(book.columns.find(x => x.id === c.dataset.editcol));
+    if (r) openRowModal(book.extraRows.find(x => x.id === r.dataset.editrow));
+  };
+  drawGradebook();
+}
+
+function buildModel() {
+  return gradebookModel(gb.book, assignmentsOf(gb.sid), gb.roster, gb.subs);
+}
+function drawGradebook() {
+  const model = buildModel();
+  const rooms = roomsOf(model.rows.filter(r => r.classroom));
+  if (!rooms.includes(ui.classroom)) ui.classroom = '';
+  $('#gb-room').innerHTML = roomOptions(rooms, ui.classroom);
+  model.rows = model.rows.filter(r => !ui.classroom || r.classroom === ui.classroom);
+  gb.model = model;
+  $('#gb-body').innerHTML = !model.cols.length && !model.rows.length
+    ? emptyState('ตารางยังว่าง เริ่มจาก "+ เพิ่มคอลัมน์" เช่น สอบกลางภาค สอบปลายภาค จิตพิสัย')
+    : gradebookTable(model, { editable: true, showGrade: gb.book.showGrade !== false });
+}
+function updateRowTotals(rk) {
+  const r = buildModel().rows.find(x => x.key === rk), tr = $(`#gb-body tr[data-row="${rk}"]`);
+  if (!r || !tr) return;
+  $('.t-total', tr).innerHTML = `<b>${r.total}</b>`;
+  $('.t-pct', tr).textContent = r.pct;
+  const g = $('.t-grade', tr);
+  if (g) g.innerHTML = `<b>${r.grade}</b>`;
+}
+
+function openColumnModal(col) {
+  const cols = gb.book.columns, idx = col ? cols.indexOf(col) : -1;
+  const m = openModal(col ? 'แก้ไขคอลัมน์' : 'เพิ่มคอลัมน์', `<form id="cf">
+    <label>ชื่อคอลัมน์<input name="title" required value="${esc(col ? col.title : '')}" placeholder="เช่น สอบกลางภาค, จิตพิสัย, หมายเหตุ"></label>
+    <label>ชนิดข้อมูล<select name="type">
+      <option value="number">คะแนน (นำไปรวม)</option>
+      <option value="text"${col && col.type === 'text' ? ' selected' : ''}>ข้อความ (ไม่นำไปรวม)</option>
+    </select></label>
+    <label id="cf-max">คะแนนเต็ม<input type="number" name="max" min="0" step="0.5" value="${col ? col.max : 10}"></label>
+    ${col ? `<div class="row" style="margin-bottom:12px">
+      <button type="button" class="btn sm" data-move="-1"${idx === 0 ? ' disabled' : ''}>← ย้ายไปซ้าย</button>
+      <button type="button" class="btn sm" data-move="1"${idx === cols.length - 1 ? ' disabled' : ''}>ย้ายไปขวา →</button>
+    </div>` : ''}
+    <div class="row">
+      <button class="btn primary">${col ? 'บันทึก' : 'เพิ่มคอลัมน์'}</button>
+      ${col ? '<button type="button" class="btn danger-ghost" id="cf-del">ลบคอลัมน์</button>' : ''}
+      <button type="button" class="btn ghost" data-close>ยกเลิก</button>
+    </div>
+  </form>`);
+  const f = $('#cf', m), el = f.elements;
+  const syncMax = () => { $('#cf-max', m).hidden = el.type.value === 'text'; };
+  el.type.onchange = syncMax;
+  syncMax();
+  f.onsubmit = e => {
+    e.preventDefault();
+    const data = { title: el.title.value.trim(), type: el.type.value, max: el.type.value === 'number' ? Number(el.max.value) || 0 : 0 };
+    if (!data.title) return;
+    if (col) Object.assign(col, data); else cols.push({ id: newId('c'), ...data });
+    saveBook({ columns: cols });
+    closeModal();
+    drawGradebook();
+  };
+  $$('[data-move]', m).forEach(b => b.onclick = () => {
+    const to = idx + Number(b.dataset.move);
+    [cols[idx], cols[to]] = [cols[to], cols[idx]];
+    saveBook({ columns: cols });
+    closeModal();
+    drawGradebook();
+  });
+  const del = $('#cf-del', m);
+  if (del) del.onclick = () => {
+    if (!confirm(`ลบคอลัมน์ "${col.title}" และข้อมูลทั้งหมดในคอลัมน์นี้?`)) return;
+    cols.splice(idx, 1);
+    const cells = {};
+    Object.keys(gb.book.cells).forEach(rk => {
+      if (col.id in gb.book.cells[rk]) { delete gb.book.cells[rk][col.id]; cells[rk] = { [col.id]: FieldValue.delete() }; }
+    });
+    saveBook({ columns: cols, cells });
+    closeModal();
+    drawGradebook();
+  };
+}
+
+function openRowModal(row) {
+  const rooms = roomsOf(students);
+  const m = openModal(row ? 'แก้ไขแถว' : 'เพิ่มแถว', `<form id="rf">
+    <p class="muted small">นักเรียนที่ลงทะเบียนวิชานี้จะแสดงในตารางอัตโนมัติ ใช้ "เพิ่มแถว" สำหรับรายชื่อที่ไม่ได้ลงทะเบียนในระบบ</p>
+    <label>ชื่อ-นามสกุล<input name="fullname" required value="${esc(row ? row.name : '')}"></label>
+    <div class="row-2">
+      <label>ห้อง<input name="classroom" list="rf-rooms" value="${esc(row ? row.classroom : ui.classroom)}" placeholder="เช่น ม.1/1"></label>
+      <label>เลขที่<input type="number" name="number" min="0" value="${esc(row ? row.number : '')}"></label>
+    </div>
+    <datalist id="rf-rooms">${rooms.map(r => `<option value="${esc(r)}">`).join('')}</datalist>
+    <div class="row">
+      <button class="btn primary">${row ? 'บันทึก' : 'เพิ่มแถว'}</button>
+      ${row ? '<button type="button" class="btn danger-ghost" id="rf-del">ลบแถว</button>' : ''}
+      <button type="button" class="btn ghost" data-close>ยกเลิก</button>
+    </div>
+  </form>`);
+  const f = $('#rf', m), el = f.elements, rows = gb.book.extraRows;
+  f.onsubmit = e => {
+    e.preventDefault();
+    const data = { name: el.fullname.value.trim(), classroom: el.classroom.value.trim(), number: el.number.value ? Number(el.number.value) : '' };
+    if (row) Object.assign(row, data); else rows.push({ id: newId('r'), ...data });
+    saveBook({ extraRows: rows });
+    closeModal();
+    drawGradebook();
+  };
+  const del = $('#rf-del', m);
+  if (del) del.onclick = () => {
+    if (!confirm(`ลบแถว "${row.name}" และคะแนนในแถวนี้?`)) return;
+    rows.splice(rows.indexOf(row), 1);
+    delete gb.book.cells[row.id];
+    saveBook({ extraRows: rows, cells: { [row.id]: FieldValue.delete() } });
+    closeModal();
+    drawGradebook();
+  };
+}
+
+function loadScript(src) {
+  return new Promise((resolve, reject) => {
+    const s = document.createElement('script');
+    s.src = src;
+    s.onload = resolve;
+    s.onerror = () => reject(new Error('โหลดตัวสร้างไฟล์ Excel ไม่สำเร็จ (ตรวจสอบอินเทอร์เน็ต)'));
+    document.head.appendChild(s);
+  });
+}
+async function exportGradebook() {
+  if (!gb || !gb.model) return;
+  try {
+    if (!window.XLSX) await loadScript('https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js');
+    const { cols, rows, fullTotal } = gb.model, showGrade = gb.book.showGrade !== false;
+    const num = v => v !== '' && !isNaN(Number(v)) ? Number(v) : v;
+    const sheetOf = list => {
+      const aoa = [['ห้อง', 'เลขที่', 'รหัสนักเรียน', 'ชื่อ-นามสกุล', ...cols.map(c => c.counted ? `${c.title} (${c.max})` : c.title), `รวม (${fullTotal})`, 'ร้อยละ', ...(showGrade ? ['เกรด'] : [])]];
+      list.forEach(r => aoa.push([r.classroom, num(r.number), r.studentId || '', r.name, ...cols.map(c => c.type === 'number' ? num(r.values[c.key]) : r.values[c.key]), r.total, r.pct, ...(showGrade ? [Number(r.grade)] : [])]));
+      const ws = XLSX.utils.aoa_to_sheet(aoa);
+      ws['!cols'] = aoa[0].map((h, i) => ({ wch: i === 3 ? 26 : Math.max(8, Math.min(24, String(h).length + 2)) }));
+      return ws;
+    };
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, sheetOf(rows), 'ทั้งหมด');
+    const rooms = [...new Set(rows.map(r => r.classroom))];
+    if (rooms.length > 1) rooms.forEach(room => {
+      XLSX.utils.book_append_sheet(wb, sheetOf(rows.filter(r => r.classroom === room)), (room ? 'ห้อง ' + room : 'อื่น ๆ').replace(/[\\\/?*\[\]:]/g, '-').slice(0, 31));
+    });
+    const s = subjectById(gb.sid);
+    XLSX.writeFile(wb, `ตารางคะแนน_${s.code}${ui.classroom ? '_' + ui.classroom.replace('/', '-') : ''}.xlsx`);
+  } catch (e) { fail(e); }
 }
 
 // ---------- นักเรียน ----------
